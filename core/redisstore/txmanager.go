@@ -112,12 +112,17 @@ func (tm *TxManager) loadExistingTxHashes() error {
 		return fmt.Errorf("failed to scan transaction keys: %v", err)
 	}
 
-	log.Info("Loaded existing transaction hashes from Redis", "count", loaded)
 	return nil
 }
 
 // Init initializes the transaction manager
 func (tm *TxManager) Init() error {
+	// Test Redis connection
+	if err := tm.client.Ping(tm.ctx).Err(); err != nil {
+		log.Error("Redis connection test failed", "err", err)
+		return fmt.Errorf("Redis connection failed: %v", err)
+	}
+
 	// Load existing transaction hashes from Redis to prevent duplicates
 	if err := tm.loadExistingTxHashes(); err != nil {
 		log.Warn("Failed to load existing transaction hashes", "err", err)
@@ -129,7 +134,6 @@ func (tm *TxManager) Init() error {
 		go tm.worker(i)
 	}
 
-	log.Info("Redis transaction manager initialized", "workers", tm.workers)
 	return nil
 }
 
@@ -415,4 +419,67 @@ func (tm *TxManager) Stats() map[string]interface{} {
 		"workers":              tm.workers,
 		"current_block_number": currentBlock,
 	}
+}
+
+// RemoveTx removes a transaction from Redis
+func (tm *TxManager) RemoveTx(hash common.Hash) error {
+	txKey := fmt.Sprintf("tx:%x", hash)
+
+	// Remove from duplicate cache
+	tm.dupMutex.Lock()
+	delete(tm.dupCache, hash)
+	tm.dupMutex.Unlock()
+
+	// Remove from Redis
+	if err := tm.client.Del(tm.ctx, txKey).Err(); err != nil {
+		log.Error("Failed to remove transaction from Redis", "hash", hash.Hex(), "key", txKey, "err", err)
+		return fmt.Errorf("failed to remove transaction from Redis: %v", err)
+	}
+
+	return nil
+}
+
+// RemoveTxs removes multiple transactions from Redis (batch operation)
+func (tm *TxManager) RemoveTxs(hashes []common.Hash) error {
+	if len(hashes) == 0 {
+		return nil
+	}
+
+	// Remove from duplicate cache
+	tm.dupMutex.Lock()
+	for _, hash := range hashes {
+		delete(tm.dupCache, hash)
+	}
+	tm.dupMutex.Unlock()
+
+	// Prepare keys for batch deletion
+	keys := make([]string, len(hashes))
+	for i, hash := range hashes {
+		keys[i] = fmt.Sprintf("tx:%x", hash)
+	}
+
+	// Batch remove from Redis
+	_, err := tm.client.Del(tm.ctx, keys...).Result()
+	if err != nil {
+		log.Error("Failed to batch remove transactions from Redis", "count", len(hashes), "err", err)
+		return fmt.Errorf("failed to batch remove transactions from Redis: %v", err)
+	}
+
+	return nil
+}
+
+// ListRedisTransactions returns all transaction hashes currently in Redis (for debugging)
+func (tm *TxManager) ListRedisTransactions() ([]string, error) {
+	var keys []string
+	iter := tm.client.Scan(tm.ctx, 0, "tx:*", 1000).Iterator()
+
+	for iter.Next(tm.ctx) {
+		keys = append(keys, iter.Val())
+	}
+
+	if err := iter.Err(); err != nil {
+		return nil, fmt.Errorf("failed to scan Redis keys: %v", err)
+	}
+
+	return keys, nil
 }

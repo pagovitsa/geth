@@ -109,6 +109,12 @@ var (
 	blockPrefetchTxsInvalidMeter = metrics.NewRegisteredMeter("chain/prefetch/txs/invalid", nil)
 	blockPrefetchTxsValidMeter   = metrics.NewRegisteredMeter("chain/prefetch/txs/valid", nil)
 
+	// Redis transaction metrics
+	redisTxRemovalMeter      = metrics.NewRegisteredMeter("chain/redis/txremoval", nil)
+	redisTxRemovalErrorMeter = metrics.NewRegisteredMeter("chain/redis/txremoval/errors", nil)
+	redisTxReorgAddMeter     = metrics.NewRegisteredMeter("chain/redis/reorg/add", nil)
+	redisTxReorgErrorMeter   = metrics.NewRegisteredMeter("chain/redis/reorg/errors", nil)
+
 	errInsertionInterrupted = errors.New("insertion is interrupted")
 	errChainStopped         = errors.New("blockchain is stopped")
 	errInvalidOldChain      = errors.New("invalid old chain")
@@ -1062,8 +1068,7 @@ func (bc *BlockChain) setHeadBeyondRoot(head uint64, time uint64, root common.Ha
 			// body, and receipt, will be removed from the ancient store
 			// in one go.
 			//
-			// The hash-to-number mapping in the key-value store will be
-			// removed by the hc.SetHead function.
+			// The hash-to-number mapping in the key-value store will be removed by the hc.SetHead function.
 		} else {
 			// Remove the associated body and receipts from the key-value store.
 			// The header, hash-to-number mapping, and canonical hash will be
@@ -1239,7 +1244,7 @@ func (bc *BlockChain) writeHeadBlock(block *types.Block) {
 		log.Crit("Failed to update chain indexes and markers", "err", err)
 	}
 
-	// Store block and logs in Redis
+	// Store block and logs in Redis, and remove mined transactions
 	if bc.redisStore != nil {
 		receipts := rawdb.ReadRawReceipts(bc.db, block.Hash(), block.NumberU64())
 		var logs []*types.Log
@@ -1249,6 +1254,29 @@ func (bc *BlockChain) writeHeadBlock(block *types.Block) {
 
 		if err := bc.redisStore.StoreBlock(block, logs); err != nil {
 			log.Error("Failed to store block in Redis", "number", block.NumberU64(), "hash", block.Hash(), "err", err)
+		}
+
+		// Remove mined transactions from Redis mempool
+		if bc.redisTxMgr != nil {
+			// Update current block number in transaction manager
+			bc.redisTxMgr.UpdateCurrentBlockNumber(block.NumberU64())
+
+			txHashes := make([]common.Hash, len(block.Transactions()))
+			for i, tx := range block.Transactions() {
+				txHashes[i] = tx.Hash()
+			}
+
+			if len(txHashes) > 0 {
+				// Use goroutine to avoid blocking blockchain operations
+				go func(hashes []common.Hash, blockNum uint64) {
+					if err := bc.redisTxMgr.RemoveTxs(hashes); err != nil {
+						log.Error("Failed to remove mined transactions from Redis", "number", blockNum, "txCount", len(hashes), "err", err)
+						redisTxRemovalErrorMeter.Mark(1)
+					} else {
+						redisTxRemovalMeter.Mark(int64(len(hashes)))
+					}
+				}(txHashes, block.NumberU64())
+			}
 		}
 	}
 
@@ -1893,9 +1921,7 @@ func (bc *BlockChain) insertChain(chain types.Blocks, setHead bool, makeWitness 
 			// block in the middle. It can only happen in the clique chain. Whenever
 			// we insert blocks via `insertSideChain`, we only commit `td`, `header`
 			// and `body` if it's non-existent. Since we don't have receipts without
-			// reexecution, so nothing to commit. But if the sidechain will be adopted
-			// as the canonical chain eventually, it needs to be reexecuted for missing
-			// state, but if it's this special case here(skip reexecution) we will lose
+			// reexecution, so nothing to commit. But if it's this special case here(skip reexecution) we will lose
 			// the empty receipt entry.
 			if len(block.Transactions()) == 0 {
 				rawdb.WriteReceipts(bc.db, block.Hash(), block.NumberU64(), nil)
@@ -2545,6 +2571,51 @@ func (bc *BlockChain) reorg(oldHead *types.Header, newHead *types.Header) error 
 	// Reset the tx lookup cache to clear stale txlookup cache.
 	bc.txLookupCache.Purge()
 
+	// Handle Redis transaction changes during reorg
+	if bc.redisTxMgr != nil {
+		// Transactions that were removed from canonical chain should be added back to mempool
+		orphanedTxs := types.HashDifference(deletedTxs, rebirthTxs)
+		if len(orphanedTxs) > 0 {
+			log.Debug("Re-adding orphaned transactions to Redis mempool during reorg", "count", len(orphanedTxs))
+
+			// Re-add orphaned transactions back to the mempool asynchronously
+			go func(txHashes []common.Hash, oldBlocks []*types.Header) {
+				addedCount := 0
+				for _, txHash := range txHashes {
+					// Find the transaction in the old blocks
+					var foundTx *types.Transaction
+					for i := 0; i < len(oldBlocks) && foundTx == nil; i++ {
+						block := bc.GetBlock(oldBlocks[i].Hash(), oldBlocks[i].Number.Uint64())
+						if block != nil {
+							for _, tx := range block.Transactions() {
+								if tx.Hash() == txHash {
+									foundTx = tx
+									break
+								}
+							}
+						}
+					}
+
+					if foundTx != nil {
+						if err := bc.redisTxMgr.StoreTx(foundTx); err != nil {
+							log.Error("Failed to re-add orphaned transaction to Redis", "hash", txHash, "err", err)
+							redisTxReorgErrorMeter.Mark(1)
+						} else {
+							addedCount++
+						}
+					} else {
+						log.Warn("Could not find orphaned transaction to re-add", "hash", txHash)
+					}
+				}
+				if addedCount > 0 {
+					redisTxReorgAddMeter.Mark(int64(addedCount))
+				}
+			}(orphanedTxs, oldChain)
+		}
+
+		// Note: Newly mined transactions are already handled by writeHeadBlock calls above
+	}
+
 	// Release the tx-lookup lock after mutation.
 	bc.txLookupLock.Unlock()
 
@@ -2622,7 +2693,7 @@ func (bc *BlockChain) skipBlock(err error, it *insertIterator) bool {
 		return false
 	}
 	// If we're not using snapshots, we can skip this, since we have both block
-	// and (trie-) state
+	// and (trie-) state.
 	if bc.snaps == nil {
 		return true
 	}
@@ -2825,4 +2896,46 @@ func (bc *BlockChain) GetTrieFlushInterval() time.Duration {
 // RedisTxMgr returns the Redis transaction manager
 func (bc *BlockChain) RedisTxMgr() *redisstore.TxManager {
 	return bc.redisTxMgr
+}
+
+// ListRedisTransactions returns all transaction hashes currently in Redis (for debugging)
+func (bc *BlockChain) ListRedisTransactions() ([]string, error) {
+	if bc.redisTxMgr == nil {
+		return nil, fmt.Errorf("Redis transaction manager not initialized")
+	}
+	return bc.redisTxMgr.ListRedisTransactions()
+}
+
+// DebugRedisTransactionRemoval manually removes specific transaction hashes from Redis (for testing)
+func (bc *BlockChain) DebugRedisTransactionRemoval(txHashes []common.Hash) error {
+	if bc.redisTxMgr == nil {
+		return fmt.Errorf("Redis transaction manager not initialized")
+	}
+
+	log.Info("DEBUG: Manual Redis transaction removal", "txCount", len(txHashes), "hashes", txHashes)
+
+	// List what's in Redis before removal
+	beforeKeys, err := bc.redisTxMgr.ListRedisTransactions()
+	if err != nil {
+		log.Error("Failed to list Redis transactions before removal", "err", err)
+	} else {
+		log.Info("Redis transactions before removal", "count", len(beforeKeys))
+	}
+
+	// Perform removal
+	err = bc.redisTxMgr.RemoveTxs(txHashes)
+	if err != nil {
+		log.Error("DEBUG: Failed to remove transactions", "err", err)
+		return err
+	}
+
+	// List what's in Redis after removal
+	afterKeys, err := bc.redisTxMgr.ListRedisTransactions()
+	if err != nil {
+		log.Error("Failed to list Redis transactions after removal", "err", err)
+	} else {
+		log.Info("Redis transactions after removal", "count", len(afterKeys))
+	}
+
+	return nil
 }

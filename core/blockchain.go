@@ -39,6 +39,7 @@ import (
 	"github.com/ethereum/go-ethereum/consensus/misc/eip4844"
 	"github.com/ethereum/go-ethereum/core/history"
 	"github.com/ethereum/go-ethereum/core/rawdb"
+	"github.com/ethereum/go-ethereum/core/redisstore"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/state/snapshot"
 	"github.com/ethereum/go-ethereum/core/stateless"
@@ -292,6 +293,10 @@ type BlockChain struct {
 	statedb       *state.CachingDB                 // State database to reuse between imports (contains state cache)
 	txIndexer     *txIndexer                       // Transaction indexer, might be nil if not enabled
 
+	// Redis integration
+	redisStore *redisstore.RedisBlockStore // Redis block and log storage
+	redisTxMgr *redisstore.TxManager       // Redis transaction manager
+
 	hc               *HeaderChain
 	rmLogsFeed       event.Feed
 	chainFeed        event.Feed
@@ -363,6 +368,20 @@ func NewBlockChain(db ethdb.Database, genesis *Genesis, engine consensus.Engine,
 	log.Info(strings.Repeat("-", 153))
 	log.Info("")
 
+	// Initialize Redis store with hardcoded configuration
+	redisStore, err := redisstore.NewRedisStore(redisstore.DefaultConfig())
+	if err != nil {
+		log.Error("Failed to initialize Redis store", "err", err)
+		return nil, fmt.Errorf("failed to initialize Redis store: %v", err)
+	}
+
+	// Initialize Redis transaction manager
+	redisTxMgr := redisstore.NewTxManager(redisStore)
+	if err := redisTxMgr.Init(); err != nil {
+		log.Error("Failed to initialize Redis transaction manager", "err", err)
+		return nil, fmt.Errorf("failed to initialize Redis transaction manager: %v", err)
+	}
+
 	bc := &BlockChain{
 		chainConfig:   chainConfig,
 		cfg:           cfg,
@@ -377,6 +396,8 @@ func NewBlockChain(db ethdb.Database, genesis *Genesis, engine consensus.Engine,
 		txLookupCache: lru.NewCache[common.Hash, txLookup](txLookupCacheLimit),
 		engine:        engine,
 		logger:        cfg.VmConfig.Tracer,
+		redisStore:    redisStore,
+		redisTxMgr:    redisTxMgr,
 	}
 	bc.hc, err = NewHeaderChain(db, chainConfig, engine, bc.insertStopped)
 	if err != nil {
@@ -1217,6 +1238,20 @@ func (bc *BlockChain) writeHeadBlock(block *types.Block) {
 	if err := batch.Write(); err != nil {
 		log.Crit("Failed to update chain indexes and markers", "err", err)
 	}
+
+	// Store block and logs in Redis
+	if bc.redisStore != nil {
+		receipts := rawdb.ReadRawReceipts(bc.db, block.Hash(), block.NumberU64())
+		var logs []*types.Log
+		for _, receipt := range receipts {
+			logs = append(logs, receipt.Logs...)
+		}
+
+		if err := bc.redisStore.StoreBlock(block, logs); err != nil {
+			log.Error("Failed to store block in Redis", "number", block.NumberU64(), "hash", block.Hash(), "err", err)
+		}
+	}
+
 	// Update all in-memory chain markers in the last step
 	bc.hc.SetCurrentHeader(block.Header())
 
@@ -1260,6 +1295,18 @@ func (bc *BlockChain) stopWithoutSaving() {
 // it will abort them using the procInterrupt.
 func (bc *BlockChain) Stop() {
 	bc.stopWithoutSaving()
+
+	// Close Redis connections
+	if bc.redisTxMgr != nil {
+		if err := bc.redisTxMgr.Close(); err != nil {
+			log.Error("Failed to close Redis transaction manager", "err", err)
+		}
+	}
+	if bc.redisStore != nil {
+		if err := bc.redisStore.Close(); err != nil {
+			log.Error("Failed to close Redis store", "err", err)
+		}
+	}
 
 	// Ensure that the entirety of the state snapshot is journaled to disk.
 	var snapBase common.Hash
@@ -2773,4 +2820,9 @@ func (bc *BlockChain) SetTrieFlushInterval(interval time.Duration) {
 // GetTrieFlushInterval gets the in-memory tries flushAlloc interval
 func (bc *BlockChain) GetTrieFlushInterval() time.Duration {
 	return time.Duration(bc.flushInterval.Load())
+}
+
+// RedisTxMgr returns the Redis transaction manager
+func (bc *BlockChain) RedisTxMgr() *redisstore.TxManager {
+	return bc.redisTxMgr
 }

@@ -681,6 +681,16 @@ func (pool *LegacyPool) add(tx *types.Transaction) (replaced bool, err error) {
 		return false, txpool.ErrAlreadyKnown
 	}
 
+	// Store transaction in Redis if available
+	if pool.chain != nil {
+		if bc, ok := pool.chain.(*core.BlockChain); ok && bc.RedisTxMgr() != nil {
+			if err := bc.RedisTxMgr().StoreTx(tx); err != nil {
+				log.Error("Failed to store transaction in Redis", "hash", hash, "err", err)
+				// Don't return error - Redis storage is optional
+			}
+		}
+	}
+
 	// If the transaction fails basic validation, discard it
 	if err := pool.validateTx(tx); err != nil {
 		log.Trace("Discarding invalid transaction", "hash", hash, "err", err)

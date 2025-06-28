@@ -56,3 +56,11 @@ cmd/evm/evm
 cmd/geth/geth
 cmd/rlpdump/rlpdump
 cmd/workload/workload
+# Redis Integration
+*.rdb
+dump.rdb
+redis.log
+
+# Development
+.env
+.env.local

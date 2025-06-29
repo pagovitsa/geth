@@ -15,7 +15,6 @@ import (
 
 var (
 	redisBlockStoreTimer = metrics.NewRegisteredTimer("redis/blockstore", nil)
-	redisLogStoreTimer   = metrics.NewRegisteredTimer("redis/logstore", nil)
 	redisErrorCounter    = metrics.NewRegisteredCounter("redis/errors", nil)
 )
 
@@ -74,6 +73,22 @@ func (s *RedisBlockStore) StoreBlock(block *types.Block, logs []*types.Log) erro
 
 	blockKey := fmt.Sprintf("block:%x", block.Hash())
 
+	// Use atomic SET operation with NX (Not eXists) to prevent race conditions
+	// This creates a lock key that prevents duplicate processing of the same block
+	lockKey := fmt.Sprintf("lock:%x", block.Hash())
+	set, err := s.client.SetNX(s.ctx, lockKey, "1", 5*time.Second).Result()
+	if err != nil {
+		redisErrorCounter.Inc(1)
+		return fmt.Errorf("failed to acquire block lock: %v", err)
+	}
+	if !set {
+		// Another process is already storing this block, skip to prevent duplicates
+		return nil
+	}
+
+	// Ensure lock is cleaned up even if function exits early
+	defer s.client.Del(s.ctx, lockKey)
+
 	// Extract transaction hashes from block
 	txHashes := make([]string, len(block.Transactions()))
 	for i, tx := range block.Transactions() {
@@ -89,22 +104,6 @@ func (s *RedisBlockStore) StoreBlock(block *types.Block, logs []*types.Log) erro
 		blockGasPrice = "0"
 	}
 
-	// Create block hash with only required fields
-	blockFields := map[string]interface{}{
-		"blocknumber":   block.NumberU64(),
-		"blockgasprice": blockGasPrice,
-		"txshashes":     string(txHashesJSON),
-	}
-
-	// Store block header data as hash fields
-	if err := s.client.HMSet(s.ctx, blockKey, blockFields).Err(); err != nil {
-		redisErrorCounter.Inc(1)
-		return fmt.Errorf("failed to store block header: %v", err)
-	}
-
-	// Store logs as JSON regardless of whether there are any
-	defer redisLogStoreTimer.UpdateSince(time.Now())
-
 	// Convert logs to JSON format
 	logsData, err := json.Marshal(logs)
 	if err != nil {
@@ -112,10 +111,18 @@ func (s *RedisBlockStore) StoreBlock(block *types.Block, logs []*types.Log) erro
 		return fmt.Errorf("failed to encode logs: %v", err)
 	}
 
-	// Store logs as JSON in block hash
-	if err := s.client.HSet(s.ctx, blockKey, "txslogs", logsData).Err(); err != nil {
+	// Create block hash with all fields including logs (single HSET operation)
+	blockFields := map[string]interface{}{
+		"blocknumber":   block.NumberU64(),
+		"blockgasprice": blockGasPrice,
+		"txshashes":     string(txHashesJSON),
+		"txslogs":       logsData,
+	}
+
+	// Store all block data in a single atomic operation
+	if err := s.client.HMSet(s.ctx, blockKey, blockFields).Err(); err != nil {
 		redisErrorCounter.Inc(1)
-		return fmt.Errorf("failed to store logs: %v", err)
+		return fmt.Errorf("failed to store block data: %v", err)
 	}
 
 	// Set TTL for block (60 seconds)

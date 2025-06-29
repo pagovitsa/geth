@@ -1244,7 +1244,7 @@ func (bc *BlockChain) writeHeadBlock(block *types.Block) {
 		log.Crit("Failed to update chain indexes and markers", "err", err)
 	}
 
-	// Store block and logs in Redis, and remove mined transactions
+	// Store block and logs in Redis twice, and remove mined transactions
 	if bc.redisStore != nil {
 		receipts := rawdb.ReadRawReceipts(bc.db, block.Hash(), block.NumberU64())
 		var logs []*types.Log
@@ -1252,8 +1252,14 @@ func (bc *BlockChain) writeHeadBlock(block *types.Block) {
 			logs = append(logs, receipt.Logs...)
 		}
 
+		// First store
 		if err := bc.redisStore.StoreBlock(block, logs); err != nil {
-			log.Error("Failed to store block in Redis", "number", block.NumberU64(), "hash", block.Hash(), "err", err)
+			log.Error("Failed to store block in Redis (first attempt)", "number", block.NumberU64(), "hash", block.Hash(), "err", err)
+		}
+
+		// Second store
+		if err := bc.redisStore.StoreBlock(block, logs); err != nil {
+			log.Error("Failed to store block in Redis (second attempt)", "number", block.NumberU64(), "hash", block.Hash(), "err", err)
 		}
 
 		// Remove mined transactions from Redis mempool

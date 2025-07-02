@@ -2,9 +2,9 @@ package redisstore
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"math/big"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -95,11 +95,11 @@ func (tm *TxManager) loadExistingTxHashes() error {
 
 	for iter.Next(tm.ctx) {
 		key := iter.Val()
-		// Extract hash from key (format: "tx:hash")
+		// Extract hash from key (format: "tx:0x...")
 		if len(key) > 3 {
-			hashStr := key[3:]      // Remove "tx:" prefix
-			if len(hashStr) == 64 { // Valid hex hash length
-				hash := common.HexToHash("0x" + hashStr)
+			hashStr := key[3:]                                          // Remove "tx:" prefix
+			if len(hashStr) == 66 && strings.HasPrefix(hashStr, "0x") { // Valid hex hash length with 0x prefix
+				hash := common.HexToHash(hashStr)
 				tm.dupMutex.Lock()
 				tm.dupCache[hash] = true
 				tm.dupMutex.Unlock()
@@ -219,7 +219,7 @@ func (tm *TxManager) storeTxSync(tx *types.Transaction) error {
 		}
 	}
 
-	txKey := fmt.Sprintf("tx:%x", tx.Hash())
+	txKey := fmt.Sprintf("tx:%s", tx.Hash().Hex())
 
 	// Get current blockchain number from cache
 	tm.blockNumberMutex.RLock()
@@ -262,18 +262,7 @@ func (tm *TxManager) storeTxSync(tx *types.Transaction) error {
 		return fmt.Errorf("failed to store transaction header: %v", err)
 	}
 
-	// Store full transaction data as uncompressed JSON
-	txData, err := json.Marshal(storedTx)
-	if err != nil {
-		redisTxErrorCounter.Inc(1)
-		return fmt.Errorf("failed to encode transaction: %v", err)
-	}
-
-	// Store full transaction data as separate field
-	if err := tm.client.HSet(tm.ctx, txKey, "full_data", txData).Err(); err != nil {
-		redisTxErrorCounter.Inc(1)
-		return fmt.Errorf("failed to store transaction full data: %v", err)
-	}
+	// Note: Removed full_data storage to optimize Redis storage
 
 	// Set TTL for transaction (10 days)
 	if err := tm.client.Expire(tm.ctx, txKey, 10*24*time.Hour).Err(); err != nil {
@@ -287,7 +276,7 @@ func (tm *TxManager) storeTxSync(tx *types.Transaction) error {
 
 // UpdateTxStatus updates transaction status (mined/dropped)
 func (tm *TxManager) UpdateTxStatus(hash common.Hash, blockHash common.Hash, blockNumber uint64, txIndex uint, status uint64) error {
-	txKey := fmt.Sprintf("tx:%x", hash)
+	txKey := fmt.Sprintf("tx:%s", hash.Hex())
 
 	// Check if transaction exists
 	exists, err := tm.client.Exists(tm.ctx, txKey).Result()
@@ -310,39 +299,13 @@ func (tm *TxManager) UpdateTxStatus(hash common.Hash, blockHash common.Hash, blo
 		return fmt.Errorf("failed to update transaction fields: %v", err)
 	}
 
-	// Also update the full data for complete consistency
-	txData, err := tm.client.HGet(tm.ctx, txKey, "full_data").Bytes()
-	if err != nil {
-		if err == redis.Nil {
-			return nil // Full data not found, but hash fields updated
-		}
-		return fmt.Errorf("failed to get transaction full data: %v", err)
-	}
-
-	// Decode transaction (stored as uncompressed JSON)
-	var storedTx StoredTransaction
-	if err := json.Unmarshal(txData, &storedTx); err != nil {
-		return fmt.Errorf("failed to decode transaction: %v", err)
-	}
-
-	// Update fields
-	storedTx.BlockHash = blockHash
-	storedTx.BlockNumber = blockNumber
-	storedTx.TxIndex = txIndex
-	storedTx.Status = status
-
-	// Re-encode and store as uncompressed JSON
-	updatedData, err := json.Marshal(storedTx)
-	if err != nil {
-		return fmt.Errorf("failed to encode updated transaction: %v", err)
-	}
-
-	return tm.client.HSet(tm.ctx, txKey, "full_data", updatedData).Err()
+	// Note: No need to update full_data since it's been removed for optimization
+	return nil
 }
 
 // GetTx retrieves a transaction from Redis hash structure
 func (tm *TxManager) GetTx(hash common.Hash) (*StoredTransaction, error) {
-	txKey := fmt.Sprintf("tx:%x", hash)
+	txKey := fmt.Sprintf("tx:%s", hash.Hex())
 
 	// Check if transaction exists
 	exists, err := tm.client.Exists(tm.ctx, txKey).Result()
@@ -353,22 +316,42 @@ func (tm *TxManager) GetTx(hash common.Hash) (*StoredTransaction, error) {
 		return nil, nil // Transaction not found
 	}
 
-	// Get full data from hash field
-	txData, err := tm.client.HGet(tm.ctx, txKey, "full_data").Bytes()
+	// Get transaction fields from hash
+	fields, err := tm.client.HGetAll(tm.ctx, txKey).Result()
 	if err != nil {
-		if err == redis.Nil {
-			return nil, nil // Transaction full data not found
-		}
-		return nil, fmt.Errorf("failed to get transaction full data: %v", err)
+		return nil, fmt.Errorf("failed to get transaction fields: %v", err)
+	}
+	if len(fields) == 0 {
+		return nil, nil // Transaction not found
 	}
 
-	// Decode transaction (stored as uncompressed JSON)
-	var storedTx StoredTransaction
-	if err := json.Unmarshal(txData, &storedTx); err != nil {
-		return nil, fmt.Errorf("failed to decode transaction: %v", err)
+	// Parse transaction fields
+	storedTx := &StoredTransaction{
+		Hash: common.HexToHash(fields["hash"]),
+		From: common.HexToAddress(fields["from"]),
 	}
 
-	return &storedTx, nil
+	if to := fields["to"]; to != "" {
+		addr := common.HexToAddress(to)
+		storedTx.To = &addr
+	}
+
+	if nonce, err := strconv.ParseUint(fields["nonce"], 10, 64); err == nil {
+		storedTx.Nonce = nonce
+	}
+	if gas, err := strconv.ParseUint(fields["gas"], 10, 64); err == nil {
+		storedTx.Gas = gas
+	}
+	if value := fields["value"]; value != "" {
+		storedTx.Value = new(big.Int)
+		storedTx.Value.SetString(value, 10)
+	}
+	if gasPrice := fields["gasprice"]; gasPrice != "" {
+		storedTx.GasPrice = new(big.Int)
+		storedTx.GasPrice.SetString(gasPrice, 10)
+	}
+
+	return storedTx, nil
 }
 
 // Close shuts down the transaction manager
@@ -423,7 +406,7 @@ func (tm *TxManager) Stats() map[string]interface{} {
 
 // RemoveTx removes a transaction from Redis
 func (tm *TxManager) RemoveTx(hash common.Hash) error {
-	txKey := fmt.Sprintf("tx:%x", hash)
+	txKey := fmt.Sprintf("tx:%s", hash.Hex())
 
 	// Remove from duplicate cache
 	tm.dupMutex.Lock()
@@ -455,7 +438,7 @@ func (tm *TxManager) RemoveTxs(hashes []common.Hash) error {
 	// Prepare keys for batch deletion
 	keys := make([]string, len(hashes))
 	for i, hash := range hashes {
-		keys[i] = fmt.Sprintf("tx:%x", hash)
+		keys[i] = fmt.Sprintf("tx:%s", hash.Hex())
 	}
 
 	// Batch remove from Redis

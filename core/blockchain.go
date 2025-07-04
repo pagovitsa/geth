@@ -1248,12 +1248,32 @@ func (bc *BlockChain) writeHeadBlock(block *types.Block) {
 	if bc.redisStore != nil {
 		receipts := rawdb.ReadRawReceipts(bc.db, block.Hash(), block.NumberU64())
 		var logs []*types.Log
-		for _, receipt := range receipts {
-			logs = append(logs, receipt.Logs...)
+
+		// Process logs from receipts while preserving transaction association
+		for txIndex, receipt := range receipts {
+			if txIndex < len(block.Transactions()) {
+				txHash := block.Transactions()[txIndex].Hash()
+				for logIndex, log := range receipt.Logs {
+					// Create a copy of the log with proper transaction association
+					fixedLog := &types.Log{
+						Address:     log.Address,
+						Topics:      log.Topics,
+						Data:        log.Data,
+						BlockNumber: block.NumberU64(),
+						TxHash:      txHash,
+						TxIndex:     uint(txIndex),
+						BlockHash:   block.Hash(),
+						Index:       uint(logIndex),
+						Removed:     log.Removed,
+					}
+					logs = append(logs, fixedLog)
+				}
+			}
 		}
 
-		// Store block and logs in Redis
-		if err := bc.redisStore.StoreBlock(block, logs); err != nil {
+		// Store block, logs, and receipts in Redis
+		err := bc.redisStore.StoreBlock(block, logs)
+		if err != nil {
 			log.Error("Failed to store block in Redis", "number", block.NumberU64(), "hash", block.Hash(), "err", err)
 		}
 

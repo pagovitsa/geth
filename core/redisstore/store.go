@@ -131,6 +131,8 @@ func (s *RedisBlockStore) StoreBlock(block *types.Block, logs []*types.Log) erro
 		if tx.Type() == 2 { // EIP-1559 transaction
 			if tx.GasFeeCap() != nil {
 				txData["maxFeePerGas"] = tx.GasFeeCap().Uint64()
+				// For EIP-1559 transactions, use maxFeePerGas as gasPrice for consistency
+				txData["gasPrice"] = tx.GasFeeCap().Uint64()
 			}
 			if tx.GasTipCap() != nil {
 				txData["maxPriorityFeePerGas"] = tx.GasTipCap().Uint64()

@@ -210,7 +210,19 @@ func (tm *TxManager) storeTxSync(tx *types.Transaction) error {
 	}
 
 	storedTx.Value = tx.Value()
-	storedTx.GasPrice = tx.GasPrice()
+
+	// Handle gas price based on transaction type
+	if tx.Type() == 2 { // EIP-1559 transaction
+		// For EIP-1559 transactions, use maxFeePerGas as gasPrice for consistency
+		if tx.GasFeeCap() != nil {
+			storedTx.GasPrice = tx.GasFeeCap()
+		} else {
+			storedTx.GasPrice = big.NewInt(0)
+		}
+	} else {
+		// Legacy transaction
+		storedTx.GasPrice = tx.GasPrice()
+	}
 
 	// Get sender (this might fail for some transactions)
 	chainID := tx.ChainId()

@@ -228,24 +228,24 @@ func (tm *TxManager) storeTxSync(tx *types.Transaction) error {
 
 	// Create transaction hash with only required fields for pending transactions
 	txFields := map[string]interface{}{
-		"hash":              strings.ToLower(storedTx.Hash.Hex()),
-		"nonce":             storedTx.Nonce,
-		"from":              strings.ToLower(storedTx.From.Hex()),
-		"rawdata":           storedTx.RawData,
-		"gasprice":          storedTx.GasPrice.String(),
-		"gas":               storedTx.Gas,
-		"value":             storedTx.Value.String(),
-		"type":              tx.Type(),       // Add transaction type (0=Legacy, 1=AccessList, 2=DynamicFee)
-		"blockchain_number": currentBlockNum, // Add current blockchain number
+		"hash":        strings.ToLower(storedTx.Hash.Hex()),
+		"nonce":       storedTx.Nonce,
+		"from":        strings.ToLower(storedTx.From.Hex()),
+		"raw":         storedTx.RawData,
+		"gasPrice":    storedTx.GasPrice.String(),
+		"gasLimit":    storedTx.Gas,
+		"value":       storedTx.Value.String(),
+		"type":        tx.Type(),       // Add transaction type (0=Legacy, 1=AccessList, 2=DynamicFee)
+		"blockNumber": currentBlockNum, // Add current blockchain number
 	}
 
 	// Add EIP-1559 fields for Type 2 transactions
 	if tx.Type() == 2 {
 		if tx.GasFeeCap() != nil {
-			txFields["maxfeepergas"] = tx.GasFeeCap().String()
+			txFields["maxFeePerGas"] = tx.GasFeeCap().String()
 		}
 		if tx.GasTipCap() != nil {
-			txFields["maxpriorityfeepergas"] = tx.GasTipCap().String()
+			txFields["maxPriorityFeePerGas"] = tx.GasTipCap().String()
 		}
 	}
 
@@ -253,7 +253,7 @@ func (tm *TxManager) storeTxSync(tx *types.Transaction) error {
 	if storedTx.To != nil {
 		txFields["to"] = strings.ToLower(storedTx.To.Hex())
 	} else {
-		txFields["to"] = "" // Empty string for contract creation
+		txFields["to"] = nil // nil for contract creation (consistent with block transactions)
 	}
 
 	// Store transaction header data as hash fields
@@ -339,14 +339,14 @@ func (tm *TxManager) GetTx(hash common.Hash) (*StoredTransaction, error) {
 	if nonce, err := strconv.ParseUint(fields["nonce"], 10, 64); err == nil {
 		storedTx.Nonce = nonce
 	}
-	if gas, err := strconv.ParseUint(fields["gas"], 10, 64); err == nil {
+	if gas, err := strconv.ParseUint(fields["gasLimit"], 10, 64); err == nil {
 		storedTx.Gas = gas
 	}
 	if value := fields["value"]; value != "" {
 		storedTx.Value = new(big.Int)
 		storedTx.Value.SetString(value, 10)
 	}
-	if gasPrice := fields["gasprice"]; gasPrice != "" {
+	if gasPrice := fields["gasPrice"]; gasPrice != "" {
 		storedTx.GasPrice = new(big.Int)
 		storedTx.GasPrice.SetString(gasPrice, 10)
 	}

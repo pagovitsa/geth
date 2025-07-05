@@ -88,12 +88,66 @@ func (s *RedisBlockStore) StoreBlock(block *types.Block, logs []*types.Log) erro
 	// Ensure lock is cleaned up even if function exits early
 	defer s.client.Del(s.ctx, lockKey)
 
-	// Extract transaction hashes from block
-	txHashes := make([]string, len(block.Transactions()))
+	// Extract full transaction data from block
+	txsData := make([]map[string]interface{}, len(block.Transactions()))
 	for i, tx := range block.Transactions() {
-		txHashes[i] = strings.ToLower(tx.Hash().Hex())
+		// Serialize transaction data to JSON-compatible format
+		txData := map[string]interface{}{
+			"hash":                 strings.ToLower(tx.Hash().Hex()),
+			"type":                 tx.Type(),
+			"nonce":                tx.Nonce(),
+			"gasPrice":             uint64(0), // Will be set below based on tx type
+			"maxFeePerGas":         uint64(0), // For EIP-1559 transactions
+			"maxPriorityFeePerGas": uint64(0), // For EIP-1559 transactions
+			"gasLimit":             tx.Gas(),
+			"value":                tx.Value().Uint64(),
+			"input":                fmt.Sprintf("0x%x", tx.Data()),
+		}
+
+		// Set to address (can be nil for contract creation)
+		if tx.To() != nil {
+			txData["to"] = strings.ToLower(tx.To().Hex())
+		} else {
+			txData["to"] = nil
+		}
+
+		// Handle different transaction types for gas pricing
+		if tx.Type() == 2 { // EIP-1559 transaction
+			if tx.GasFeeCap() != nil {
+				txData["maxFeePerGas"] = tx.GasFeeCap().Uint64()
+			}
+			if tx.GasTipCap() != nil {
+				txData["maxPriorityFeePerGas"] = tx.GasTipCap().Uint64()
+			}
+		} else {
+			// Legacy transaction
+			if tx.GasPrice() != nil {
+				txData["gasPrice"] = tx.GasPrice().Uint64()
+			}
+		}
+
+		// Add access list for EIP-2930 and EIP-1559 transactions
+		if tx.Type() == 1 || tx.Type() == 2 {
+			accessList := tx.AccessList()
+			if len(accessList) > 0 {
+				accessListData := make([]map[string]interface{}, len(accessList))
+				for j, access := range accessList {
+					storageKeys := make([]string, len(access.StorageKeys))
+					for k, key := range access.StorageKeys {
+						storageKeys[k] = strings.ToLower(key.Hex())
+					}
+					accessListData[j] = map[string]interface{}{
+						"address":     strings.ToLower(access.Address.Hex()),
+						"storageKeys": storageKeys,
+					}
+				}
+				txData["accessList"] = accessListData
+			}
+		}
+
+		txsData[i] = txData
 	}
-	txHashesJSON, _ := json.Marshal(txHashes)
+	txsDataJSON, _ := json.Marshal(txsData)
 
 	// Get block gas price (base fee or 0 if not available)
 	var blockGasPrice string
@@ -165,11 +219,11 @@ func (s *RedisBlockStore) StoreBlock(block *types.Block, logs []*types.Log) erro
 
 	// Create block hash with all fields including logs (single HSET operation)
 	blockFields := map[string]interface{}{
-		"blockhash":     strings.ToLower(block.Hash().Hex()),
-		"blocknumber":   block.NumberU64(),
-		"blockgasprice": blockGasPrice,
-		"txshashes":     string(txHashesJSON),
-		"txslogs":       logsData,
+		"hash":     strings.ToLower(block.Hash().Hex()),
+		"number":   block.NumberU64(),
+		"gasPrice": blockGasPrice,
+		"txs":      string(txsDataJSON),
+		"logs":     logsData,
 	}
 
 	// Store all block data in a single atomic operation
@@ -235,8 +289,8 @@ func (s *RedisBlockStore) findBlockKeyByHash(hash common.Hash) (string, error) {
 	iter := s.client.Scan(s.ctx, 0, "block:*", 1000).Iterator()
 	for iter.Next(s.ctx) {
 		key := iter.Val()
-		// Get the blockhash field
-		storedHash, err := s.client.HGet(s.ctx, key, "blockhash").Result()
+		// Get the hash field (updated field name)
+		storedHash, err := s.client.HGet(s.ctx, key, "hash").Result()
 		if err != nil {
 			if err == redis.Nil {
 				continue // No hash field, skip
@@ -278,8 +332,8 @@ func (s *RedisBlockStore) GetLogsByNumber(blockNumber uint64) ([]*types.Log, err
 
 // getLogsFromKey retrieves logs from a specific block key
 func (s *RedisBlockStore) getLogsFromKey(blockKey string) ([]*types.Log, error) {
-	// Get logs data from hash field
-	logsData, err := s.client.HGet(s.ctx, blockKey, "txslogs").Bytes()
+	// Get logs data from hash field (updated field name)
+	logsData, err := s.client.HGet(s.ctx, blockKey, "logs").Bytes()
 	if err != nil {
 		if err == redis.Nil {
 			return nil, nil // Logs not found

@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"strings"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/metrics"
 	"github.com/go-redis/redis/v8"
 )
@@ -107,8 +109,22 @@ func (s *RedisBlockStore) StoreBlock(block *types.Block, logs []*types.Log) erro
 		// Set to address (can be nil for contract creation)
 		if tx.To() != nil {
 			txData["to"] = strings.ToLower(tx.To().Hex())
+			txData["contractAddress"] = nil
 		} else {
 			txData["to"] = nil
+			// For contract creation transactions, calculate the contract address
+			// We need to get the sender address to calculate the contract address
+			chainID := tx.ChainId()
+			if chainID != nil && chainID.Cmp(big.NewInt(0)) > 0 {
+				if from, err := types.Sender(types.LatestSignerForChainID(chainID), tx); err == nil {
+					contractAddr := crypto.CreateAddress(from, tx.Nonce())
+					txData["contractAddress"] = strings.ToLower(contractAddr.Hex())
+				} else {
+					txData["contractAddress"] = nil
+				}
+			} else {
+				txData["contractAddress"] = nil
+			}
 		}
 
 		// Handle different transaction types for gas pricing

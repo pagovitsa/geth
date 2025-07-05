@@ -11,6 +11,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/metrics"
 	"github.com/go-redis/redis/v8"
@@ -252,8 +253,12 @@ func (tm *TxManager) storeTxSync(tx *types.Transaction) error {
 	// Add 'to' field if it exists
 	if storedTx.To != nil {
 		txFields["to"] = strings.ToLower(storedTx.To.Hex())
+		txFields["contractAddress"] = nil
 	} else {
 		txFields["to"] = nil // nil for contract creation (consistent with block transactions)
+		// For contract creation transactions, calculate the contract address
+		contractAddr := crypto.CreateAddress(storedTx.From, storedTx.Nonce)
+		txFields["contractAddress"] = strings.ToLower(contractAddr.Hex())
 	}
 
 	// Store transaction header data as hash fields
